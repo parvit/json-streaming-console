@@ -1,0 +1,140 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Custom release version (e.g. v1.0.0 or 1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release'
+        required: false
+        type: boolean
+        default: false
+      custom_notes:
+        description: 'Custom release notes / description (leave blank to auto-generate)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  draft-release:
+    name: Build & Draft Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+          cache: true
+
+      - name: Resolve Version Tag
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            RAW_VER="${{ inputs.version }}"
+          else
+            RAW_VER="${GITHUB_REF_NAME}"
+          fi
+          # Strip leading/trailing whitespace
+          RAW_VER="$(echo "$RAW_VER" | tr -d '[:space:]')"
+
+          # Normalize to semantic version tag with leading 'v'
+          if [[ "$RAW_VER" =~ ^[0-9] ]]; then
+            TAG="v$RAW_VER"
+          else
+            TAG="$RAW_VER"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Target release tag: $TAG"
+
+      - name: Build Cross-Platform Binaries
+        run: |
+          mkdir -p dist
+          APP_NAME="json-streaming-console"
+          TAG="${{ steps.ver.outputs.tag }}"
+
+          TARGETS=(
+            "linux/amd64"
+            "windows/amd64"
+          )
+
+          for TARGET in "${TARGETS[@]}"; do
+            GOOS="${TARGET%/*}"
+            GOARCH="${TARGET#*/}"
+            PKG_NAME="${APP_NAME}_${TAG}_${GOOS}_${GOARCH}"
+
+            echo "Compiling ${GOOS}/${GOARCH}..."
+            if [ "$GOOS" = "windows" ]; then
+              BIN_TARGET="dist/${APP_NAME}.exe"
+              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+                -ldflags="-s -w -X main.version=${TAG}" \
+                -o "$BIN_TARGET" .
+              (cd dist && zip "${PKG_NAME}.zip" "${APP_NAME}.exe" && rm "${APP_NAME}.exe")
+            else
+              BIN_TARGET="dist/${APP_NAME}"
+              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+                -ldflags="-s -w -X main.version=${TAG}" \
+                -o "$BIN_TARGET" .
+              (cd dist && tar -czf "${PKG_NAME}.tar.gz" "${APP_NAME}" && rm "${APP_NAME}")
+            fi
+          done
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Ensure Git Tag Exists
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Creating and pushing tag $TAG..."
+            git tag "$TAG"
+            git push origin "$TAG"
+          else
+            echo "Tag $TAG already exists on remote."
+          fi
+
+      - name: Create or Update Draft Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+          CUSTOM_NOTES: ${{ inputs.custom_notes }}
+        run: |
+          FLAGS=(--draft --title "$TAG")
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            FLAGS+=(--prerelease)
+          fi
+
+          if [ -n "$CUSTOM_NOTES" ]; then
+            FLAGS+=(--notes "$CUSTOM_NOTES")
+          else
+            FLAGS+=(--generate-notes)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Draft release for $TAG exists. Uploading new assets..."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "Creating new draft release for $TAG..."
+            gh release create "$TAG" dist/* "${FLAGS[@]}"
+          fi

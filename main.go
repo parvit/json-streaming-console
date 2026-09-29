@@ -26,6 +26,7 @@ const (
 var (
 	log         zerolog.Logger
 	activeColor string
+	version     = "dev"
 )
 
 type StreamFormatter interface {
@@ -136,10 +137,19 @@ func init() {
 }
 
 func main() {
+	var versionFlag bool
+	flag.BoolVar(&versionFlag, "version", false, "display application version")
+	flag.BoolVar(&versionFlag, "v", false, "display application version (shorthand)")
+
 	var formatFlag string
 	flag.StringVar(&formatFlag, "format", "gemini", "streaming JSON format parser: gemini or claude")
 	flag.StringVar(&formatFlag, "f", "gemini", "streaming JSON format parser (shorthand)")
 	flag.Parse()
+
+	if versionFlag {
+		fmt.Printf("json-streaming-console %s\n", version)
+		return
+	}
 
 	var formatter StreamFormatter
 	switch strings.ToLower(strings.TrimSpace(formatFlag)) {
