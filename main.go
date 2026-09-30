@@ -27,6 +27,7 @@ var (
 	log         zerolog.Logger
 	activeColor string
 	version     = "dev"
+	osExit      = os.Exit
 )
 
 type StreamFormatter interface {
@@ -34,11 +35,10 @@ type StreamFormatter interface {
 	End()
 }
 
-func init() {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixNano
-
+func newConsoleWriter(out io.Writer, noColor bool) zerolog.ConsoleWriter {
 	output := zerolog.ConsoleWriter{
-		Out:        os.Stdout,
+		Out:        out,
+		NoColor:    noColor,
 		TimeFormat: time.RFC3339,
 		PartsOrder: []string{
 			zerolog.TimestampFieldName,
@@ -133,52 +133,27 @@ func init() {
 		}
 	}
 
-	log = zerolog.New(output).With().Timestamp().Logger()
+	return output
 }
 
-func main() {
-	var versionFlag bool
-	flag.BoolVar(&versionFlag, "version", false, "display application version")
-	flag.BoolVar(&versionFlag, "v", false, "display application version (shorthand)")
+func init() {
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixNano
+	log = zerolog.New(newConsoleWriter(os.Stdout, false)).With().Timestamp().Logger()
+}
 
-	var formatFlag string
-	flag.StringVar(&formatFlag, "format", "gemini", "streaming JSON format parser: gemini or claude")
-	flag.StringVar(&formatFlag, "f", "gemini", "streaming JSON format parser (shorthand)")
-	flag.Parse()
-
-	if versionFlag {
-		fmt.Printf("json-streaming-console %s\n", version)
-		return
-	}
-
-	var formatter StreamFormatter
+func getFormatter(formatFlag string) (StreamFormatter, error) {
 	switch strings.ToLower(strings.TrimSpace(formatFlag)) {
 	case "gemini":
-		formatter = NewGeminiFormatter()
+		return NewGeminiFormatter(), nil
 	case "claude":
-		formatter = NewClaudeFormatter()
+		return NewClaudeFormatter(), nil
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown format: %q. Supported formats: gemini, claude\n", formatFlag)
-		os.Exit(1)
+		return nil, fmt.Errorf("Unknown format: %q. Supported formats: gemini, claude", formatFlag)
 	}
+}
 
-	defer func() {
-		if err := recover(); err != nil {
-			formatter.End()
-			fmt.Printf("Fatal: %s\n", err)
-			os.Exit(1)
-		}
-	}()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		formatter.End()
-		os.Exit(0)
-	}()
-
-	reader := bufio.NewReader(os.Stdin)
+func processStream(r io.Reader, formatter StreamFormatter) error {
+	reader := bufio.NewReader(r)
 	for {
 		textData, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -190,10 +165,10 @@ func main() {
 					}
 				}
 				formatter.End()
-				return
+				return nil
 			}
 			formatter.End()
-			panic(err)
+			return err
 		}
 
 		map_data := make(map[string]any)
@@ -204,4 +179,64 @@ func main() {
 			log.Print(string(textData))
 		}
 	}
+}
+
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitCode int) {
+	fs := flag.NewFlagSet("json-streaming-console", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var versionFlag bool
+	fs.BoolVar(&versionFlag, "version", false, "display application version")
+	fs.BoolVar(&versionFlag, "v", false, "display application version (shorthand)")
+
+	var formatFlag string
+	fs.StringVar(&formatFlag, "format", "gemini", "streaming JSON format parser: gemini or claude")
+	fs.StringVar(&formatFlag, "f", "gemini", "streaming JSON format parser (shorthand)")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+
+	if versionFlag {
+		fmt.Fprintf(stdout, "json-streaming-console %s\n", version)
+		return 0
+	}
+
+	formatter, err := getFormatter(formatFlag)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			formatter.End()
+			fmt.Fprintf(stderr, "Fatal: %s\n", r)
+			exitCode = 1
+		}
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+	go func() {
+		select {
+		case <-sigChan:
+			formatter.End()
+			osExit(0)
+		}
+	}()
+
+	if err := processStream(stdin, formatter); err != nil {
+		panic(err)
+	}
+	return 0
+}
+
+func runMain() int {
+	return run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+}
+
+func main() {
+	osExit(runMain())
 }
